@@ -41,39 +41,15 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
   String _curr = "全部資產";
   String _type = "EXPENSE";
   String _selectedAccountForTx = "";
-  String _selectedCategory = "";
 
   String _userRole = "貓狗共用觀看";
   String _newAccountOwner = "共用";
 
-  List<String> _localAccountNames = [];
   Map<String, String> _globalAccountOwners = {};
   List<String> _accountOrder = []; // 用來存儲資產卡片的排序
-
-  final List<String> _expenseCategories = [
-    "日用品",
-    "餐飲",
-    "交通",
-    "娛樂",
-    "服飾",
-    "教育",
-    "美容",
-    "零食",
-    "親子",
-    "數位",
-    "社交",
-    "旅遊",
-    "寵物",
-    "居住",
-    "汽車",
-    "生活繳費",
-    "茶酒",
-    "醫療",
-    "美妝",
-    "遊戲",
-  ];
-
-  final List<String> _incomeCategories = ["薪水", "獎金", "投資", "兼職", "其他收入"];
+  List<Widget> _cachedTransactionWidgets = []; // 緩存已構建的交易 widgets
+  Map<String, String> _accountDocIds = {}; // 🚀 優化：緩存賬戶 ID 避免查詢
+  Map<String, int> _cachedBalances = {}; // 🚀 優化：本地緩存餘額，實現樂觀更新
 
   InputDecoration _inputDec(String label) => InputDecoration(
     labelText: label,
@@ -85,7 +61,6 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
     _t.clear();
     _a.clear();
     _selectedAccountForTx = "";
-    _selectedCategory = "";
     _type = "EXPENSE";
 
     showDialog(
@@ -99,12 +74,37 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    TextField(controller: _t, decoration: _inputDec('項目名稱')),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _t,
+                            decoration: _inputDec('項目名稱'),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          color: Colors.red.shade400,
+                          onPressed: () => setDialogState(() => _t.clear()),
+                        ),
+                      ],
+                    ),
                     const SizedBox(height: 12),
-                    TextField(
-                      controller: _a,
-                      keyboardType: TextInputType.number,
-                      decoration: _inputDec('金額'),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _a,
+                            keyboardType: TextInputType.number,
+                            decoration: _inputDec('金額'),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.delete_outline),
+                          color: Colors.red.shade400,
+                          onPressed: () => setDialogState(() => _a.clear()),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 12),
                     StreamBuilder<QuerySnapshot>(
@@ -301,57 +301,27 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                                     .collection('transactions')
                                     .add(txData);
 
-                                final accountSnapshot = await FirebaseFirestore
-                                    .instance
-                                    .collection('accounts')
-                                    .where('name', isEqualTo: targetAccountName)
-                                    .get();
-
+                                // 🚀 第一步：本地乐观更新余额 (立即显示)
+                                int currentLocalBalance =
+                                    _cachedBalances[targetAccountName] ?? 0;
+                                int newLocalBalance;
+                                if (currentOwner == "信用卡") {
+                                  newLocalBalance = _type == "EXPENSE"
+                                      ? currentLocalBalance + amt
+                                      : currentLocalBalance - amt;
+                                } else {
+                                  newLocalBalance = _type == "EXPENSE"
+                                      ? currentLocalBalance - amt
+                                      : currentLocalBalance + amt;
+                                }
+                                _cachedBalances[targetAccountName] =
+                                    newLocalBalance;
                                 print(
-                                  "🔍 查詢賬戶: $targetAccountName, 找到 ${accountSnapshot.docs.length} 個文檔",
+                                  "⚡ 乐观更新: $targetAccountName 余额 $currentLocalBalance -> $newLocalBalance",
                                 );
 
-                                if (accountSnapshot.docs.isNotEmpty) {
-                                  final accountRef =
-                                      accountSnapshot.docs.first.reference;
-                                  print(
-                                    "📝 更新賬戶: $targetAccountName, 類型: $_type, 金額: $amt",
-                                  );
-
-                                  await FirebaseFirestore.instance.runTransaction((
-                                    transaction,
-                                  ) async {
-                                    final snapshot = await transaction.get(
-                                      accountRef,
-                                    );
-                                    if (snapshot.exists) {
-                                      int currentBalance =
-                                          (snapshot.data()?['balance'] as num?)
-                                              ?.toInt() ??
-                                          0;
-                                      int newBalance;
-                                      if (currentOwner == "信用卡") {
-                                        newBalance = _type == "EXPENSE"
-                                            ? currentBalance + amt
-                                            : currentBalance - amt;
-                                      } else {
-                                        newBalance = _type == "EXPENSE"
-                                            ? currentBalance - amt
-                                            : currentBalance + amt;
-                                      }
-                                      print(
-                                        "💰 余額變化: $currentBalance -> $newBalance",
-                                      );
-                                      transaction.update(accountRef, {
-                                        'balance': newBalance,
-                                      });
-                                    }
-                                  });
-                                } else {
-                                  print("❌ 未找到賬戶: $targetAccountName");
-                                }
-
                                 if (mounted) {
+                                  setState(() {});
                                   ScaffoldMessenger.of(
                                     dialogContext,
                                   ).clearSnackBars();
@@ -360,6 +330,16 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                                   ).showSnackBar(
                                     const SnackBar(content: Text('✅ 記帳成功')),
                                   );
+                                }
+
+                                // 🚀 第二步：后台异步同步到 Firestore (不阻塞 UI)
+                                _syncAddTransactionToFirestore(
+                                  targetAccountName,
+                                  currentOwner,
+                                  newLocalBalance,
+                                );
+
+                                if (mounted) {
                                   Future.delayed(
                                     const Duration(milliseconds: 300),
                                     () {
@@ -427,72 +407,116 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
     }
   }
 
-  // 1. 雲端同步：修正後的安全記帳邏輯
-  void _addTx() async {
-    final int? amt = int.tryParse(_a.text);
-    if (_t.text.isEmpty || amt == null) return;
-
-    String targetAccountName = _selectedAccountForTx;
-
-    if (targetAccountName.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('⚠️ 請先選擇要記帳的資產唷！')));
-      return;
+  // 🚀 優化：提取交易分組邏輯
+  List<Widget> _buildTransactionWidgets(List<Map<String, dynamic>> displayTxs) {
+    if (displayTxs.isEmpty) {
+      return [const Center(child: Text("🐾 這裡沒有可見的記帳紀錄唷！"))];
     }
 
-    String currentOwner = _globalAccountOwners[targetAccountName] ?? "共用";
-
-    final txData = {
-      "title": _t.text,
-      "amount": amt,
-      "type": _type,
-      "account": targetAccountName,
-      "date": DateTime.now().toIso8601String(),
-    };
-
-    try {
-      // 先建立交易紀錄
-      await FirebaseFirestore.instance.collection('transactions').add(txData);
-
-      // 🛠️ 核心修正：改用正確的 'name' 欄位條件去搜尋 accounts 裡的文件
-      final accountSnapshot = await FirebaseFirestore.instance
-          .collection('accounts')
-          .where('name', isEqualTo: targetAccountName)
-          .get();
-
-      if (accountSnapshot.docs.isNotEmpty) {
-        final accountRef = accountSnapshot.docs.first.reference;
-        await FirebaseFirestore.instance.runTransaction((transaction) async {
-          final snapshot = await transaction.get(accountRef);
-          if (snapshot.exists) {
-            int currentBalance =
-                (snapshot.data()?['balance'] as num?)?.toInt() ?? 0;
-            int newBalance;
-            if (currentOwner == "信用卡") {
-              newBalance = _type == "EXPENSE"
-                  ? currentBalance + amt
-                  : currentBalance - amt;
-            } else {
-              newBalance = _type == "EXPENSE"
-                  ? currentBalance - amt
-                  : currentBalance + amt;
-            }
-            transaction.update(accountRef, {'balance': newBalance});
-          }
-        });
+    // 按日期分組交易
+    Map<String, List<Map<String, dynamic>>> groupedByDate = {};
+    for (var tx in displayTxs) {
+      String dateKey = "";
+      try {
+        final dateTime = DateTime.parse(tx["date"] as String);
+        dateKey =
+            "${dateTime.year}-${dateTime.month.toString().padLeft(2, '0')}-${dateTime.day.toString().padLeft(2, '0')}";
+      } catch (e) {
+        dateKey = "未知日期";
       }
-    } catch (e) {
-      print("記帳同步失敗: $e");
+
+      if (!groupedByDate.containsKey(dateKey)) {
+        groupedByDate[dateKey] = [];
+      }
+      groupedByDate[dateKey]!.add(tx);
     }
 
-    _t.clear();
-    _a.clear();
-    setState(() {
-      _selectedAccountForTx = "";
-    });
-    FocusScope.of(context).unfocus(); // 自動收起鍵盤
+    // 建立顯示列表
+    List<Widget> items = [];
+    final today = DateTime.now();
+
+    for (var date in groupedByDate.keys) {
+      // 添加日期標籤
+      String dateLabel = date;
+      try {
+        final dateParts = date.split('-');
+        final month = int.parse(dateParts[1]);
+        final day = int.parse(dateParts[2]);
+        final year = int.parse(dateParts[0]);
+        final txDate = DateTime(year, month, day);
+        final isToday =
+            txDate.year == today.year &&
+            txDate.month == today.month &&
+            txDate.day == today.day;
+        dateLabel = isToday ? "$month月${day}日，今天" : "$month月${day}日";
+      } catch (e) {
+        dateLabel = date;
+      }
+
+      items.add(
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: Text(
+            dateLabel,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: Colors.grey,
+            ),
+          ),
+        ),
+      );
+
+      // 添加該日期的所有交易
+      for (var item in groupedByDate[date]!) {
+        items.add(
+          ListTile(
+            leading: Icon(
+              item["type"] == "EXPENSE" ? Icons.pets : Icons.savings,
+              color: item["type"] == "EXPENSE" ? Colors.orange : Colors.green,
+            ),
+            title: Text(
+              item["title"],
+              style: const TextStyle(fontWeight: FontWeight.w500),
+            ),
+            subtitle: Text(item["account"]),
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  (item["type"] == "EXPENSE" ? "-" : "+") +
+                      item["amount"].toString(),
+                  style: TextStyle(
+                    color: item["type"] == "EXPENSE"
+                        ? Colors.red
+                        : Colors.green,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                GestureDetector(
+                  onTap: () => _deleteTx(item),
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Icon(
+                      Icons.delete_outline,
+                      size: 24,
+                      color: Colors.red.shade400,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+    }
+
+    return items;
   }
+
+  // 1. 雲端同步：修正後的安全記帳邏輯
 
   // 2. 雲端同步：長按刪除記帳紀錄
   void _deleteTx(Map<String, dynamic> item) async {
@@ -504,40 +528,131 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
     if (docId == null) return;
 
     try {
+      // 第一步：刪除交易記錄（立即執行）
       await FirebaseFirestore.instance
           .collection('transactions')
           .doc(docId)
           .delete();
 
-      final accountSnapshot = await FirebaseFirestore.instance
-          .collection('accounts')
-          .where('name', isEqualTo: accountName)
-          .get();
+      // 🚀 第二步：本地樂觀更新余額 (立即更新 UI，不等 Firestore)
+      String currentOwner = _globalAccountOwners[accountName] ?? "共用";
+      int currentLocalBalance = _cachedBalances[accountName] ?? 0;
+      int newLocalBalance;
+      if (currentOwner == "信用卡") {
+        newLocalBalance = type == "EXPENSE"
+            ? currentLocalBalance - amt
+            : currentLocalBalance + amt;
+      } else {
+        newLocalBalance = type == "EXPENSE"
+            ? currentLocalBalance + amt
+            : currentLocalBalance - amt;
+      }
+      _cachedBalances[accountName] = newLocalBalance;
+      print("⚡ 樂觀更新: $accountName 余額 $currentLocalBalance -> $newLocalBalance");
 
-      if (accountSnapshot.docs.isNotEmpty) {
-        final accountRef = accountSnapshot.docs.first.reference;
+      // 立即更新 UI
+      if (mounted) {
+        setState(() {});
+      }
+
+      // 🚀 第三步：後台異步同步到 Firestore（不阻塞 UI）
+      _syncBalanceToFirestore(accountName, currentOwner, newLocalBalance);
+    } catch (e) {
+      print("刪除紀錄失敗: $e");
+    }
+  }
+
+  // 🚀 後台異步同步余額到 Firestore
+  void _syncBalanceToFirestore(
+    String accountName,
+    String currentOwner,
+    int newBalance,
+  ) async {
+    try {
+      DocumentReference? accountRef;
+      if (_accountDocIds.containsKey(accountName)) {
+        accountRef = FirebaseFirestore.instance
+            .collection('accounts')
+            .doc(_accountDocIds[accountName]!);
+        print("🔄 使用緩存同步: $accountName");
+      } else {
+        // 備選：查詢
+        final accountSnapshot = await FirebaseFirestore.instance
+            .collection('accounts')
+            .where('name', isEqualTo: accountName)
+            .get();
+        if (accountSnapshot.docs.isNotEmpty) {
+          accountRef = accountSnapshot.docs.first.reference;
+          print("🔍 查詢同步: $accountName");
+        }
+      }
+
+      if (accountRef != null) {
+        final finalAccountRef = accountRef;
         await FirebaseFirestore.instance.runTransaction((transaction) async {
-          final snapshot = await transaction.get(accountRef);
+          final snapshot = await transaction.get(finalAccountRef);
           if (snapshot.exists) {
-            int currentBalance =
-                (snapshot.data()?['balance'] as num?)?.toInt() ?? 0;
-            String currentOwner = snapshot.data()?['owner'] ?? "共用";
-            int newBalance;
-            if (currentOwner == "信用卡") {
-              newBalance = type == "EXPENSE"
-                  ? currentBalance - amt
-                  : currentBalance + amt;
-            } else {
-              newBalance = type == "EXPENSE"
-                  ? currentBalance + amt
-                  : currentBalance - amt;
+            int firestoreBalance =
+                (snapshot.data() as Map<String, dynamic>?)?['balance']
+                    as int? ??
+                0;
+            // 只有當 Firestore 比本地舊時才更新
+            if (newBalance != firestoreBalance) {
+              transaction.update(finalAccountRef, {'balance': newBalance});
+              print("✅ Firestore 同步完成: $accountName = $newBalance");
             }
-            transaction.update(accountRef, {'balance': newBalance});
           }
         });
       }
     } catch (e) {
-      print("刪除紀錄失敗: $e");
+      print("後台同步失敗: $e");
+    }
+  }
+
+  // 🚀 后台异步同步到 Firestore (添加交易版本)
+  void _syncAddTransactionToFirestore(
+    String accountName,
+    String currentOwner,
+    int newBalance,
+  ) async {
+    try {
+      DocumentReference? accountRef;
+      if (_accountDocIds.containsKey(accountName)) {
+        accountRef = FirebaseFirestore.instance
+            .collection('accounts')
+            .doc(_accountDocIds[accountName]!);
+        print("🔄 后台同步 (缓存): $accountName");
+      } else {
+        // 备选：查询
+        final accountSnapshot = await FirebaseFirestore.instance
+            .collection('accounts')
+            .where('name', isEqualTo: accountName)
+            .get();
+        if (accountSnapshot.docs.isNotEmpty) {
+          accountRef = accountSnapshot.docs.first.reference;
+          print("🔍 后台同步 (查询): $accountName");
+        }
+      }
+
+      if (accountRef != null) {
+        final finalAccountRef = accountRef;
+        await FirebaseFirestore.instance.runTransaction((transaction) async {
+          final snapshot = await transaction.get(finalAccountRef);
+          if (snapshot.exists) {
+            int firestoreBalance =
+                (snapshot.data() as Map<String, dynamic>?)?['balance']
+                    as int? ??
+                0;
+            // 只有当 Firestore 比本地旧时才更新
+            if (newBalance != firestoreBalance) {
+              transaction.update(finalAccountRef, {'balance': newBalance});
+              print("✅ Firestore 同步完成: $accountName = $newBalance");
+            }
+          }
+        });
+      }
+    } catch (e) {
+      print("后台同步失败: $e");
     }
   }
 
@@ -895,6 +1010,7 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
 
               List<String> tempNormalAccs = [];
               Map<String, String> tempGlobalOwners = {};
+              Map<String, String> tempAccountDocIds = {}; // 🚀 優化：本地緩存賬戶 ID
 
               // 🛠️ 僅封鎖舊架構殘留的 Document ID 垃圾資料，不擋新中文欄位
               List<String> banList = ["現金", "共同存款", "信用卡"];
@@ -905,6 +1021,13 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                 final data = doc.data() as Map<String, dynamic>;
                 String name = data['name'] ?? "";
                 if (name.isEmpty) continue;
+
+                // 🚀 優化：存儲賬戶 ID 以避免日後查詢
+                tempAccountDocIds[name] = doc.id;
+
+                // 🚀 優化：同步 Firestore 余額到本地緩存
+                int firestoreBalance = (data['balance'] as num?)?.toInt() ?? 0;
+                _cachedBalances[name] = firestoreBalance;
 
                 // 打印所有賬戶信息用於調試
                 print(
@@ -951,8 +1074,8 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                 _forceInitDefaultAccounts();
               }
 
-              _localAccountNames = tempNormalAccs;
               _globalAccountOwners = tempGlobalOwners;
+              _accountDocIds = tempAccountDocIds; // 🚀 優化：更新本地賬戶 ID 緩存
 
               // 初始化和更新資產排序
               if (_accountOrder.isEmpty) {
@@ -1006,7 +1129,10 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                     ..._accountOrder
                         .where((name) => cloudAccs.containsKey(name))
                         .map<Widget>((accountName) {
-                          final balance = cloudAccs[accountName]!;
+                          // 🚀 優化：優先使用本地緩存余額，其次 Firestore 余額
+                          final balance =
+                              _cachedBalances[accountName] ??
+                              cloudAccs[accountName]!;
                           final bool sel = _curr == accountName;
                           final String owner =
                               accountOwners[accountName] ?? "共用";
@@ -1174,128 +1300,20 @@ class _DoggyHomeScreenState extends State<DoggyHomeScreen> {
                     ? cloudTxs
                     : cloudTxs.where((tx) => tx["account"] == _curr).toList();
 
-                if (displayTxs.isEmpty) {
+                // 🚀 優化：使用提取的方法來構建 widgets
+                _cachedTransactionWidgets = _buildTransactionWidgets(
+                  displayTxs,
+                );
+
+                if (_cachedTransactionWidgets.isEmpty) {
                   return const Center(child: Text("🐾 這裡沒有可見的記帳紀錄唷！"));
                 }
 
-                // 按日期分組交易
-                Map<String, List<Map<String, dynamic>>> groupedByDate = {};
-                for (var tx in displayTxs) {
-                  String dateKey = "";
-                  try {
-                    final dateTime = DateTime.parse(tx["date"] as String);
-                    dateKey =
-                        "${dateTime.year}-${dateTime.month.toString().padLeft(2, '0')}-${dateTime.day.toString().padLeft(2, '0')}";
-                  } catch (e) {
-                    dateKey = "未知日期";
-                  }
-
-                  if (!groupedByDate.containsKey(dateKey)) {
-                    groupedByDate[dateKey] = [];
-                  }
-                  groupedByDate[dateKey]!.add(tx);
-                }
-
-                // 建立顯示列表
-                List<Widget> items = [];
-                for (var date in groupedByDate.keys) {
-                  // 添加日期標籤
-                  try {
-                    final dateParts = date.split('-');
-                    final month = int.parse(dateParts[1]);
-                    final day = int.parse(dateParts[2]);
-                    final txDate = DateTime(
-                      int.parse(dateParts[0]),
-                      month,
-                      day,
-                    );
-                    final today = DateTime.now();
-                    final isToday =
-                        txDate.year == today.year &&
-                        txDate.month == today.month &&
-                        txDate.day == today.day;
-
-                    final dateLabel = isToday
-                        ? "$month月${day}日，今天"
-                        : "$month月${day}日";
-
-                    items.add(
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                        child: Text(
-                          dateLabel,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: Colors.grey,
-                          ),
-                        ),
-                      ),
-                    );
-                  } catch (e) {
-                    items.add(
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-                        child: Text(
-                          date,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                            color: Colors.grey,
-                          ),
-                        ),
-                      ),
-                    );
-                  }
-
-                  // 添加該日期的所有交易
-                  for (var item in groupedByDate[date]!) {
-                    items.add(
-                      ListTile(
-                        leading: Icon(
-                          item["type"] == "EXPENSE"
-                              ? Icons.pets
-                              : Icons.savings,
-                          color: item["type"] == "EXPENSE"
-                              ? Colors.orange
-                              : Colors.green,
-                        ),
-                        title: Text(
-                          item["title"],
-                          style: const TextStyle(fontWeight: FontWeight.w500),
-                        ),
-                        subtitle: Text(item["account"]),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              (item["type"] == "EXPENSE" ? "-" : "+") +
-                                  item["amount"].toString(),
-                              style: TextStyle(
-                                color: item["type"] == "EXPENSE"
-                                    ? Colors.red
-                                    : Colors.green,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 16,
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            GestureDetector(
-                              onTap: () => _deleteTx(item),
-                              child: Icon(
-                                Icons.delete_outline,
-                                size: 20,
-                                color: Colors.grey.shade600,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  }
-                }
-
-                return ListView(children: items);
+                return ListView.builder(
+                  itemCount: _cachedTransactionWidgets.length,
+                  itemBuilder: (context, index) =>
+                      _cachedTransactionWidgets[index],
+                );
               },
             ),
           ),
