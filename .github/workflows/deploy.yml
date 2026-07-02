@@ -1,0 +1,53 @@
+name: Deploy Flutter Web to GitHub Pages
+
+# This workflow deploys the pre-built Flutter web artifacts stored in the
+# gh-pages branch to GitHub Pages.
+#
+# IMPORTANT: For this workflow to run instead of the auto-generated
+# pages-build-deployment workflow, you must go to:
+#   Repository Settings → Pages → Source → GitHub Actions
+#
+on:
+  push:
+    branches:
+      - gh-pages
+  workflow_dispatch:
+
+# Grant the minimum required permissions for Pages deployment
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment; cancel older pending ones
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Prepare artifact (exclude .github directory)
+        run: |
+          mkdir -p /tmp/pages-artifact
+          rsync -av --exclude='.github' --exclude='.git' . /tmp/pages-artifact/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # The gh-pages branch stores the pre-built Flutter web output at the root
+          path: '/tmp/pages-artifact'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
